@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -31,7 +35,16 @@ var (
 
 	debug   bool
 	version bool
+
+	webhook bool
 )
+
+type event struct {
+	PullRequest *github.PullRequest `json:"pull_request"`
+	Repository  *github.Repository
+	Number      int
+	Action      string
+}
 
 func init() {
 	// parse flags
@@ -41,6 +54,8 @@ func init() {
 	flag.BoolVar(&version, "version", false, "print version and exit")
 	flag.BoolVar(&version, "v", false, "print version and exit (shorthand)")
 	flag.BoolVar(&debug, "d", false, "run in debug mode")
+
+	flag.BoolVar(&webhook, "webhook", false, "Handle github webhook events instead of checking for events")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, fmt.Sprintf(BANNER, VERSION))
@@ -100,10 +115,75 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("parsing %s as duration failed: %v", interval, err)
 	}
-	ticker = time.NewTicker(dur)
 
 	logrus.Infof("Bot started for user %s.", username)
+	fmt.Println("webhook: ", webhook)
+	if webhook {
+		listenHooks(8080, client, username)
+	} else {
+		notifier(dur, client, username)
+	}
+}
 
+func buildHandler(client *github.Client, username string) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		b, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			logrus.Fatal("Failed to read request body")
+		}
+		evt := event{}
+		err = json.Unmarshal(b, &evt)
+
+		if err != nil {
+			logrus.Fatal("Failed to read request body")
+		}
+		if evt.PullRequest != nil {
+			if evt.Action == "closed" {
+				err = closePR(client, username, evt.PullRequest)
+				if err != nil {
+					logrus.Errorf("Failed to close PullRequest %d on %s: %s", *evt.PullRequest.Number, *evt.Repository.FullName, err.Error())
+				}
+			} else {
+				logrus.Infof("Skipping PR event, PR %d on %s state %s is not closed", *evt.PullRequest.Number, *evt.Repository.FullName, evt.Action)
+			}
+		} else {
+			logrus.Infof("Skipping non PR event %v", evt)
+		}
+	}
+}
+
+func listenHooks(port int, client *github.Client, username string) {
+	http.HandleFunc("/", buildHandler(client, username))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
+}
+
+func closePR(client *github.Client, username string, pr *github.PullRequest) error {
+	if *pr.State == "closed" && *pr.Merged {
+		// If the PR was made from a repository owned by the current user,
+		// let's delete it.
+		branch := *pr.Head.Ref
+		if pr.Head.Repo == nil {
+			return nil
+		}
+		if pr.Head.Repo.Owner == nil {
+			return nil
+		}
+		owner := *pr.Head.Repo.Owner.Login
+		// Never delete the master branch or a branch we do not own.
+		if owner == username && branch != "master" {
+			_, err := client.Git.DeleteRef(username, *pr.Head.Repo.Name, strings.Replace("heads/"+*pr.Head.Ref, "#", "%23", -1))
+			// 422 is the error code for when the branch does not exist.
+			if err != nil && !strings.Contains(err.Error(), " 422 ") {
+				return err
+			}
+			logrus.Infof("Branch %s on %s/%s no longer exists.", branch, owner, *pr.Head.Repo.Name)
+		}
+	}
+	return nil
+}
+
+func notifier(dur time.Duration, client *github.Client, username string) {
+	ticker := time.NewTicker(dur)
 	for range ticker.C {
 		page := 1
 		perPage := 20
@@ -158,35 +238,13 @@ func handleNotification(client *github.Client, notification *github.Notification
 		if err != nil {
 			return err
 		}
-
 		pr, _, err := client.PullRequests.Get(*notification.Repository.Owner.Login, *notification.Repository.Name, int(id))
 		if err != nil {
 			return err
 		}
+		return closePR(client, username, pr)
 
-		if *pr.State == "closed" && *pr.Merged {
-			// If the PR was made from a repository owned by the current user,
-			// let's delete it.
-			branch := *pr.Head.Ref
-			if pr.Head.Repo == nil {
-				return nil
-			}
-			if pr.Head.Repo.Owner == nil {
-				return nil
-			}
-			owner := *pr.Head.Repo.Owner.Login
-			// Never delete the master branch or a branch we do not own.
-			if owner == username && branch != "master" {
-				_, err := client.Git.DeleteRef(username, *pr.Head.Repo.Name, strings.Replace("heads/"+*pr.Head.Ref, "#", "%23", -1))
-				// 422 is the error code for when the branch does not exist.
-				if err != nil && !strings.Contains(err.Error(), " 422 ") {
-					return err
-				}
-				logrus.Infof("Branch %s on %s/%s no longer exists.", branch, owner, *pr.Head.Repo.Name)
-			}
-		}
 	}
-
 	return nil
 }
 
